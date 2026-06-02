@@ -6,14 +6,27 @@
 from __future__ import annotations
 
 import os
+import socket
+import threading
 import uuid
+from contextlib import suppress
 
 import pytest
+import uvicorn
+from finelog.client import LogClient
+from finelog.server.asgi import build_log_server_asgi
+from finelog.server.service import LogServiceImpl
+from finelog.server.stats_service import StatsServiceImpl
+from finelog.store import LogStore
 from fray import ResourceConfig
 from zephyr import counters
 from zephyr.dataset import Dataset
 from zephyr.execution import ZephyrContext, ZephyrWorkerError
 from zephyr.runners import InlineRunner, SubprocessRunner
+from zephyr.stats import (
+    ZEPHYR_STAGE_STATS_NAMESPACE,
+    ZEPHYR_WORKER_STATS_NAMESPACE,
+)
 
 
 def _ctx(local_client, tmp_path, *, stage_runner_factory) -> ZephyrContext:
@@ -155,3 +168,74 @@ def test_subprocess_runner_isolates_native_crash(local_client, tmp_path):
     rendered = str(exc_info.value)
     assert "Shard 0" in rendered
     assert "exited with code 139" in rendered or "failed" in rendered
+
+
+@pytest.fixture()
+def finelog_server(tmp_path):
+    """Start a real finelog server on a free port and yield its URL."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    store = LogStore(log_dir=tmp_path / "finelog")
+    service = LogServiceImpl(log_store=store)
+    stats_service = StatsServiceImpl(log_store=store)
+    app = build_log_server_asgi(service, stats_service=stats_service)
+
+    started_event = threading.Event()
+
+    class _Server(uvicorn.Server):
+        async def startup(self, sockets=None):
+            await super().startup(sockets=sockets)
+            started_event.set()
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", log_config=None)
+    server = _Server(config)
+    t = threading.Thread(target=server.run, daemon=True, name="finelog-test-server")
+    t.start()
+
+    if not started_event.wait(timeout=5.0):
+        raise RuntimeError("finelog test server did not start in time")
+
+    yield f"http://127.0.0.1:{port}"
+
+    server.should_exit = True
+    t.join(timeout=5.0)
+    store.close()
+
+
+def test_finelog_stats_emitted(local_client, tmp_path, finelog_server, monkeypatch):
+    """Pipeline emits rows to both zephyr.stage and zephyr.worker finelog tables."""
+    clients: list[LogClient] = []
+
+    def make_client() -> LogClient:
+        c = LogClient.connect(finelog_server)
+        clients.append(c)
+        return c
+
+    monkeypatch.setattr("zephyr.execution._make_log_client", make_client)
+    monkeypatch.setattr("zephyr.runners._make_log_client", make_client)
+
+    ctx = _ctx(local_client, tmp_path, stage_runner_factory=lambda n: InlineRunner(num_workers=n))
+    try:
+        ds = Dataset.from_list(list(range(10))).map(lambda x: x)
+        ctx.execute(ds)
+    finally:
+        ctx.shutdown()
+
+    # ctx.shutdown() closes the coordinator's client; close any runner clients too.
+    for c in clients:
+        with suppress(Exception):
+            c.close()
+
+    query_client = LogClient.connect(finelog_server)
+    try:
+        stage_rows = query_client.query(f'SELECT * FROM "{ZEPHYR_STAGE_STATS_NAMESPACE}"')
+        worker_rows = query_client.query(f'SELECT * FROM "{ZEPHYR_WORKER_STATS_NAMESPACE}"')
+    finally:
+        query_client.close()
+
+    assert stage_rows.num_rows >= 1, "Expected stage stat rows, got none"
+    assert worker_rows.num_rows >= 1, "Expected worker stat rows, got none"
+    stage_names = stage_rows.column("stage_name").to_pylist()
+    assert any("map" in s.lower() for s in stage_names), f"No map stage in {stage_names}"

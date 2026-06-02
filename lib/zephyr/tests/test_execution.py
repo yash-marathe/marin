@@ -24,8 +24,6 @@ from zephyr.dataset import Dataset
 from zephyr.execution import (
     MAX_SHARD_FAILURES,
     MAX_SHARD_INFRA_FAILURES,
-    ZEPHYR_STAGE_BYTES_PROCESSED_KEY,
-    ZEPHYR_STAGE_ITEM_COUNT_KEY,
     CoordinatorUnreachable,
     CounterSnapshot,
     ListShard,
@@ -41,6 +39,7 @@ from zephyr.execution import (
     zephyr_worker_ctx,
 )
 from zephyr.plan import PhysicalStage, StageType, compute_plan
+from zephyr.stats import ZEPHYR_STAGE_BYTES_PROCESSED_KEY, ZEPHYR_STAGE_ITEM_COUNT_KEY
 
 
 def test_simple_map(zephyr_ctx):
