@@ -39,7 +39,7 @@ def increment(name: str, value: int = 1) -> None:
     worker.increment_counter(name, value)
 
 
-def set(name: str, value: int) -> None:  # noqa: A001
+def set_counter(name: str, value: int) -> None:
     """Overwrite a named counter with ``value`` (not additive).
 
     Use for point-in-time metrics (cpu percent, current RSS) that should

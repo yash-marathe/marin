@@ -26,6 +26,7 @@ from zephyr.runners import InlineRunner, SubprocessRunner
 from zephyr.stats import (
     ZEPHYR_STAGE_STATS_NAMESPACE,
     ZEPHYR_WORKER_STATS_NAMESPACE,
+    StatsWriter,
 )
 
 
@@ -206,15 +207,14 @@ def finelog_server(tmp_path):
 
 def test_finelog_stats_emitted(local_client, tmp_path, finelog_server, monkeypatch):
     """Pipeline emits rows to both zephyr.stage and zephyr.worker finelog tables."""
-    clients: list[LogClient] = []
+    writers: list[StatsWriter] = []
 
-    def make_client() -> LogClient:
-        c = LogClient.connect(finelog_server)
-        clients.append(c)
-        return c
+    def make_writer(url: str | None = None) -> StatsWriter:
+        w = StatsWriter(LogClient.connect(finelog_server))
+        writers.append(w)
+        return w
 
-    monkeypatch.setattr("zephyr.execution._make_log_client", make_client)
-    monkeypatch.setattr("zephyr.runners._make_log_client", make_client)
+    monkeypatch.setattr(StatsWriter, "connect", staticmethod(make_writer))
 
     ctx = _ctx(local_client, tmp_path, stage_runner_factory=lambda n: InlineRunner(num_workers=n))
     try:
@@ -223,10 +223,10 @@ def test_finelog_stats_emitted(local_client, tmp_path, finelog_server, monkeypat
     finally:
         ctx.shutdown()
 
-    # ctx.shutdown() closes the coordinator's client; close any runner clients too.
-    for c in clients:
+    # ctx.shutdown() closes the coordinator's writer; close any runner writers too.
+    for w in writers:
         with suppress(Exception):
-            c.close()
+            w.close()
 
     query_client = LogClient.connect(finelog_server)
     try:
@@ -237,5 +237,21 @@ def test_finelog_stats_emitted(local_client, tmp_path, finelog_server, monkeypat
 
     assert stage_rows.num_rows >= 1, "Expected stage stat rows, got none"
     assert worker_rows.num_rows >= 1, "Expected worker stat rows, got none"
+
     stage_names = stage_rows.column("stage_name").to_pylist()
     assert any("map" in s.lower() for s in stage_names), f"No map stage in {stage_names}"
+
+    # Stage stat correctness: items processed, throughput > 0, status = END.
+    total_items = sum(stage_rows.column("items").to_pylist())
+    assert total_items >= 10, f"Expected >= 10 items across stage rows, got {total_items}"
+    elapsed_values = stage_rows.column("elapsed").to_pylist()
+    assert all(e >= 0 for e in elapsed_values), f"Negative elapsed in stage rows: {elapsed_values}"
+    item_rates = stage_rows.column("item_rate").to_pylist()
+    assert all(r >= 0 for r in item_rates), f"Negative item_rate in stage rows: {item_rates}"
+    statuses = stage_rows.column("status").to_pylist()
+    assert all(s == "END" for s in statuses), f"Unexpected stage statuses: {statuses}"
+
+    # Worker stat correctness: at least one START and one END row per shard.
+    worker_statuses = worker_rows.column("status").to_pylist()
+    assert "START" in worker_statuses, f"No START worker rows: {worker_statuses}"
+    assert "END" in worker_statuses, f"No END worker rows: {worker_statuses}"

@@ -53,27 +53,27 @@ def test_counters_noop_outside_worker():
         _worker_ctx_var.reset(token)
 
 
-def test_counters_set():
-    """set() overwrites the counter value rather than accumulating."""
+def test_counters_set_counter():
+    """set_counter() overwrites the counter value rather than accumulating."""
     worker = FakeWorker()
     token = _worker_ctx_var.set(worker)
     try:
         counters.increment("visits", 5)
-        counters.set("visits", 2)  # overwrites, not 5+2
+        counters.set_counter("visits", 2)  # overwrites, not 5+2
         assert counters.get_counters() == {"visits": 2}
 
-        counters.set("mem_bytes", 1024)
-        counters.set("mem_bytes", 2048)  # replaces previous value
+        counters.set_counter("mem_bytes", 1024)
+        counters.set_counter("mem_bytes", 2048)  # replaces previous value
         assert counters.get_counters()["mem_bytes"] == 2048
     finally:
         _worker_ctx_var.reset(token)
 
 
-def test_set_noop_outside_worker():
-    """set() is a no-op when not inside a Zephyr worker context."""
+def test_set_counter_noop_outside_worker():
+    """set_counter() is a no-op when not inside a Zephyr worker context."""
     token = _worker_ctx_var.set(None)
     try:
-        counters.set("anything", 999)  # should not raise
+        counters.set_counter("anything", 999)  # should not raise
         assert counters.get_counters() == {}
     finally:
         _worker_ctx_var.reset(token)

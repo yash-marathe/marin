@@ -32,14 +32,11 @@ import time
 import traceback
 from collections.abc import Iterator
 from contextlib import suppress
-from datetime import datetime, timezone
 from typing import Any, TypeVar
 
 import cloudpickle
 import psutil
 import pyarrow as pa
-from finelog.client import LogClient, Table
-from iris.client import get_iris_ctx
 from rigging.filesystem import open_url
 from rigging.log_setup import configure_logging
 
@@ -48,7 +45,6 @@ from zephyr.execution import (
     ShardTask,
     StageRunner,
     TaskResult,
-    _make_log_client,
     _shared_data_path,
     _stage_throughput,
     _worker_ctx_var,
@@ -64,8 +60,7 @@ from zephyr.stats import (
     ZEPHYR_WORKER_IO_WRITE_KEY,
     ZEPHYR_WORKER_MEM_CURRENT_KEY,
     ZEPHYR_WORKER_MEM_PEAK_KEY,
-    ZEPHYR_WORKER_STATS_NAMESPACE,
-    ZephyrWorkerStat,
+    StatsWriter,
     ZephyrWorkerStatStatus,
 )
 
@@ -165,56 +160,13 @@ def _sample_process_stats(
         ctx.set_counter(ZEPHYR_WORKER_IO_WRITE_KEY.format(stage_name=stage_name), io.write_bytes)
 
 
-def _emit_runner_stat(
-    log_table: Any,
-    task: ShardTask,
-    execution_id: str,
-    status: ZephyrWorkerStatStatus,
-    start_time: float,
-    ctx: _InProcessWorkerContext,
-    proc: psutil.Process,
-    cpu_s_at_start: float,
-) -> None:
-    """Emit one ZephyrWorkerStat row to finelog from inside the runner."""
-    elapsed = time.monotonic() - start_time
-    counters = ctx._counters
-    throughput = _stage_throughput(counters, task.stage_name, elapsed)
-    try:
-        current_cpu = proc.cpu_times()
-        cumulative_cpu_s = max(0.0, (current_cpu.user + current_cpu.system) - cpu_s_at_start)
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        cumulative_cpu_s = 0.0
-    avg_cpu_pct = (cumulative_cpu_s / elapsed * 100) if elapsed > 0 else 0.0
-    stat = ZephyrWorkerStat(
-        execution_id=execution_id,
-        stage_name=task.stage_name,
-        shard_idx=task.shard_idx,
-        status=status,
-        ts=datetime.now(timezone.utc).replace(tzinfo=None),
-        items=throughput.items if throughput else 0,
-        bytes_processed=throughput.bytes_processed if throughput else 0,
-        item_rate=throughput.item_rate if throughput else 0.0,
-        byte_rate=throughput.byte_rate if throughput else 0.0,
-        cumulative_cpu_s=cumulative_cpu_s,
-        avg_cpu_pct=avg_cpu_pct,
-        mem_current_bytes=counters.get(ZEPHYR_WORKER_MEM_CURRENT_KEY.format(stage_name=task.stage_name), 0),
-        mem_peak_bytes=counters.get(ZEPHYR_WORKER_MEM_PEAK_KEY.format(stage_name=task.stage_name), 0),
-        io_read_bytes=counters.get(ZEPHYR_WORKER_IO_READ_KEY.format(stage_name=task.stage_name), 0),
-        io_write_bytes=counters.get(ZEPHYR_WORKER_IO_WRITE_KEY.format(stage_name=task.stage_name), 0),
-    )
-    try:
-        log_table.write([stat])
-    except Exception:
-        logger.warning("Failed to write runner worker stat to finelog", exc_info=True)
-
-
 def _periodic_sampler(
     stop_event: threading.Event,
     ctx: _InProcessWorkerContext,
     interval: float,
     *,
     cpu_s_at_start: float = 0.0,
-    log_table: Any = None,
+    stats_writer: StatsWriter | None = None,
     task: ShardTask | None = None,
     execution_id: str = "",
     start_time: float = 0.0,
@@ -226,31 +178,17 @@ def _periodic_sampler(
             if task is not None and proc is not None:
                 _sample_process_stats(ctx, cpu_s_at_start, task.stage_name, proc)
 
-            if log_table is not None and task is not None and proc is not None:
-                _emit_runner_stat(
-                    log_table,
-                    task,
+            if stats_writer is not None and task is not None and proc is not None:
+                stats_writer.emit_worker_stat(
+                    task.stage_name,
+                    task.shard_idx,
                     execution_id,
                     ZephyrWorkerStatStatus.RUNNING,
                     start_time,
-                    ctx,
-                    proc,
-                    cpu_s_at_start,
+                    ctx._counters,
                 )
         except Exception:
             logger.warning("Failed to sample/emit process stats", exc_info=True)
-
-
-def _resolve_finelog_url() -> str | None:
-    """Resolve the finelog endpoint URL via the Iris controller registry."""
-    iris_ctx = get_iris_ctx()
-    if iris_ctx is None or iris_ctx.client is None:
-        return None
-    try:
-        return iris_ctx.client.resolve_endpoint("/system/log-server")
-    except Exception:
-        logger.warning("Could not resolve finelog endpoint for runner stats", exc_info=True)
-        return None
 
 
 def _run_task_with_ctx(
@@ -306,25 +244,6 @@ class InlineRunner:
     def __init__(self, num_workers: int = 1) -> None:
         self._num_workers = num_workers
         self._ctx: _InProcessWorkerContext | None = None
-        self._log_client: LogClient | None = None
-        self._worker_stats_table: Table | None = None
-        self._log_client_initialized: bool = False
-
-    def _get_worker_stats_table(self) -> Any:
-        if not self._log_client_initialized:
-            self._log_client_initialized = True
-            self._log_client = _make_log_client()
-            if self._log_client is not None:
-                try:
-                    self._worker_stats_table = self._log_client.get_table(
-                        ZEPHYR_WORKER_STATS_NAMESPACE, ZephyrWorkerStat
-                    )
-                except Exception:
-                    logger.warning(
-                        "Could not initialize finelog worker stats table; worker stats disabled", exc_info=True
-                    )
-                    self._log_client = None
-        return self._worker_stats_table
 
     def execute(
         self,
@@ -336,16 +255,15 @@ class InlineRunner:
         self._ctx = ctx
         worker_token = _worker_ctx_var.set(ctx)
         stop_event = threading.Event()
-        log_table = self._get_worker_stats_table()
+        stats_writer = StatsWriter.connect()
         proc = psutil.Process()
         start_time = time.monotonic()
         cpu_times_at_start = proc.cpu_times()
         cpu_s_at_start = cpu_times_at_start.user + cpu_times_at_start.system
         proc.cpu_percent()  # prime so subsequent calls have a baseline
-        if log_table is not None:
-            _emit_runner_stat(
-                log_table, task, execution_id, ZephyrWorkerStatStatus.START, start_time, ctx, proc, cpu_s_at_start
-            )
+        stats_writer.emit_worker_stat(
+            task.stage_name, task.shard_idx, execution_id, ZephyrWorkerStatStatus.START, start_time, ctx._counters
+        )
         sampler = threading.Thread(
             target=_periodic_sampler,
             kwargs={
@@ -353,7 +271,7 @@ class InlineRunner:
                 "ctx": ctx,
                 "interval": SUBPROCESS_STATS_INTERVAL,
                 "cpu_s_at_start": cpu_s_at_start,
-                "log_table": log_table,
+                "stats_writer": stats_writer,
                 "task": task,
                 "execution_id": execution_id,
                 "start_time": start_time,
@@ -369,10 +287,10 @@ class InlineRunner:
             stop_event.set()
             sampler.join(timeout=2.0)
             _sample_process_stats(ctx, cpu_s_at_start, task.stage_name, proc)
-            if log_table is not None:
-                _emit_runner_stat(
-                    log_table, task, execution_id, ZephyrWorkerStatStatus.END, start_time, ctx, proc, cpu_s_at_start
-                )
+            stats_writer.emit_worker_stat(
+                task.stage_name, task.shard_idx, execution_id, ZephyrWorkerStatStatus.END, start_time, ctx._counters
+            )
+            stats_writer.close()
             _worker_ctx_var.reset(worker_token)
             self._ctx = None
         return result, dict(ctx._counters)
@@ -459,7 +377,7 @@ class SubprocessRunner:
         chunk_prefix: str,
         execution_id: str,
     ) -> tuple[TaskResult, dict[str, int]]:
-        finelog_url = _resolve_finelog_url()  # Requires Iris context, so called here and passed to subprocess
+        finelog_url = StatsWriter.resolve_url()  # Requires Iris context, so called here and passed to subprocess
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
             cloudpickle.dump((task, chunk_prefix, execution_id, finelog_url), f)
             task_file = f.name
@@ -548,8 +466,7 @@ def _execute_shard_subprocess(task_file: str, result_file: str, num_workers: int
     sampler: threading.Thread | None = None
     result_or_error: Any
     ctx: _InProcessWorkerContext | None = None
-    log_client: Any = None
-    log_table: Any = None
+    stats_writer: StatsWriter = StatsWriter(None)
     proc = psutil.Process()
     start_time = time.monotonic()
     cpu_times_at_start = proc.cpu_times()
@@ -560,21 +477,15 @@ def _execute_shard_subprocess(task_file: str, result_file: str, num_workers: int
             task, chunk_prefix, execution_id, finelog_url = cloudpickle.load(f)
 
         if finelog_url:
-            try:
-                log_client = LogClient.connect(finelog_url)
-                log_table = log_client.get_table(ZEPHYR_WORKER_STATS_NAMESPACE, ZephyrWorkerStat)
-            except Exception:
-                logger.warning("Could not connect to finelog in subprocess; worker stats disabled", exc_info=True)
-                log_client = None
+            stats_writer = StatsWriter.connect(finelog_url)
 
         ctx = _InProcessWorkerContext(chunk_prefix, execution_id, num_workers=num_workers)
         _worker_ctx_var.set(ctx)
 
         shard_monotonic_start = time.monotonic()
-        if log_table is not None:
-            _emit_runner_stat(
-                log_table, task, execution_id, ZephyrWorkerStatStatus.START, start_time, ctx, proc, cpu_s_at_start
-            )
+        stats_writer.emit_worker_stat(
+            task.stage_name, task.shard_idx, execution_id, ZephyrWorkerStatStatus.START, start_time, ctx._counters
+        )
 
         flusher = threading.Thread(
             target=_periodic_counter_writer,
@@ -608,7 +519,7 @@ def _execute_shard_subprocess(task_file: str, result_file: str, num_workers: int
                 "ctx": ctx,
                 "interval": SUBPROCESS_STATS_INTERVAL,
                 "cpu_s_at_start": cpu_s_at_start,
-                "log_table": log_table,
+                "stats_writer": stats_writer,
                 "task": task,
                 "execution_id": execution_id,
                 "start_time": start_time,
@@ -639,23 +550,10 @@ def _execute_shard_subprocess(task_file: str, result_file: str, num_workers: int
         if ctx is not None:
             with suppress(Exception):
                 _sample_process_stats(ctx, cpu_s_at_start, task.stage_name, proc)
-        if log_table is not None and ctx is not None:
-            try:
-                _emit_runner_stat(
-                    log_table,
-                    task,
-                    execution_id,
-                    ZephyrWorkerStatStatus.END,
-                    start_time,
-                    ctx,
-                    proc,
-                    cpu_s_at_start,
-                )
-            except Exception:
-                logger.warning("Failed to emit END runner stat", exc_info=True)
-        if log_client is not None:
-            with suppress(Exception):
-                log_client.close()
+            stats_writer.emit_worker_stat(
+                task.stage_name, task.shard_idx, execution_id, ZephyrWorkerStatStatus.END, start_time, ctx._counters
+            )
+        stats_writer.close()
 
     with open(result_file, "wb") as f:
         counters_out = dict(ctx._counters) if ctx is not None else {}
